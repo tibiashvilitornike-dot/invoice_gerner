@@ -22,6 +22,7 @@ import base64
 import json
 import os
 import re
+from io import BytesIO
 
 import requests
 from flask import Flask, request, jsonify
@@ -99,8 +100,8 @@ RULES:
 - Quantities and prices must be numbers, never strings.
 - Never invent products, quantities or prices that were not stated.
 
-SUPPLIER PRICE LISTS (PDF):
-- The user may upload a supplier price list as a PDF (e.g. cable supplier Elvare). Extract only the products the user asks for, or all listed products if they say to include everything, with quantities from the user's message.
+SUPPLIER PRICE LISTS (PDF, Excel or CSV):
+- The user may upload a supplier price list as a PDF document or as extracted spreadsheet text (Excel/CSV, tab-separated). Extract only the products the user asks for, or all listed products if they say to include everything, with quantities from the user's message.
 - If supplier prices are in USD, use them as cost_usd (manual=false) with the exchange_rate/transport/profit the user gives.
 - If supplier prices are in GEL and the user gives a markup %, compute the final unit price yourself: price = supplier_price * (1 + markup/100), rounded to 2 decimals, and output the item as manual=true with that price.
 - Per-product markups override the global one ("კაბელებზე 15%, დანარჩენზე 10%").
@@ -122,7 +123,7 @@ HELP_TEXT = (
     "მონტაჟი დეტექტორზე 15 ლარი, დანარჩენზე 20 ლარი.\n"
     "კაბელი JE-H(St)H 1x2x0.8 — 800 მეტრი, 2.5 ლარი მეტრი, მონტაჟი 1.5 ლარი.\n"
     "სახარჯი მასალები 5%.\n\n"
-    "📄 ასევე შეგიძლიათ ატვირთოთ მომწოდებლის პრაისი PDF ფორმატში — "
+    "📄 ასევე შეგიძლიათ ატვირთოთ მომწოდებლის პრაისი PDF, Excel (.xlsx) ან CSV ფორმატში — "
     "შემდეგ მომწერეთ რომელი პროდუქტები გჭირდებათ, რაოდენობები, "
     "მარკაპი (მაგ. 10% ან 15%, ან სხვადასხვა პროდუქტზე სხვადასხვა) "
     "და მონტაჟის ფასები.\n\n"
@@ -158,6 +159,21 @@ def tg_download_file(file_id):
         f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=60)
     f.raise_for_status()
     return f.content
+
+
+def excel_to_text(file_bytes):
+    """Convert an .xlsx price list into plain text (tab-separated) for Claude."""
+    import openpyxl
+    wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True, read_only=True)
+    lines = []
+    for ws in wb.worksheets:
+        lines.append(f"=== Sheet: {ws.title} ===")
+        for row in ws.iter_rows(values_only=True):
+            if any(v is not None and str(v).strip() for v in row):
+                lines.append("\t".join("" if v is None else str(v) for v in row))
+    wb.close()
+    text = "\n".join(lines)
+    return text[:60000]  # safety cap
 
 
 # ---------------------------------------------------------------- Claude parse
@@ -215,29 +231,58 @@ def webhook():
     document = message.get("document")
     if document:
         mime = document.get("mime_type", "")
+        fname = (document.get("file_name") or "").lower()
         size = document.get("file_size", 0)
-        if mime != "application/pdf":
-            tg_send_text(chat_id, "ამ ეტაპზე მხოლოდ PDF ფაილების მიღება შემიძლია.")
+
+        is_pdf = mime == "application/pdf" or fname.endswith(".pdf")
+        is_xlsx = (mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                   or fname.endswith(".xlsx"))
+        is_csv = mime in ("text/csv", "text/plain") or fname.endswith((".csv", ".txt"))
+
+        if fname.endswith(".xls") and not is_xlsx:
+            tg_send_text(chat_id, "ძველი .xls ფორმატს ვერ ვკითხულობ — "
+                                  "გთხოვთ შეინახოთ როგორც .xlsx და ისე ატვირთოთ.")
+            return jsonify(ok=True)
+        if not (is_pdf or is_xlsx or is_csv):
+            tg_send_text(chat_id, "მიღებული ფორმატები: PDF, Excel (.xlsx) და CSV.")
             return jsonify(ok=True)
         if size > 15 * 1024 * 1024:
             tg_send_text(chat_id, "ფაილი ძალიან დიდია (მაქს. 15 MB).")
             return jsonify(ok=True)
+
         try:
-            pdf_bytes = tg_download_file(document["file_id"])
+            file_bytes = tg_download_file(document["file_id"])
         except Exception:
             app.logger.exception("File download failed")
             tg_send_text(chat_id, "ფაილის ჩამოტვირთვა ვერ მოხერხდა, სცადეთ თავიდან.")
             return jsonify(ok=True)
 
         caption = (message.get("caption") or "").strip()
-        content = [
-            {"type": "document",
-             "source": {"type": "base64",
-                        "media_type": "application/pdf",
-                        "data": base64.b64encode(pdf_bytes).decode()}},
-            {"type": "text",
-             "text": caption or "მომწოდებლის პრაისი ავტვირთე. (supplier price list uploaded)"},
-        ]
+        default_note = "მომწოდებლის პრაისი ავტვირთე. (supplier price list uploaded)"
+
+        if is_pdf:
+            content = [
+                {"type": "document",
+                 "source": {"type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64.b64encode(file_bytes).decode()}},
+                {"type": "text", "text": caption or default_note},
+            ]
+        else:
+            try:
+                if is_xlsx:
+                    sheet_text = excel_to_text(file_bytes)
+                else:
+                    sheet_text = file_bytes.decode("utf-8-sig", errors="replace")[:60000]
+            except Exception:
+                app.logger.exception("Spreadsheet read failed")
+                tg_send_text(chat_id, "ფაილის წაკითხვა ვერ მოხერხდა — "
+                                      "დარწმუნდით რომ სწორი Excel/CSV ფაილია.")
+                return jsonify(ok=True)
+            content = (f"Supplier price list ({fname}), extracted contents:\n"
+                       f"{sheet_text}\n\n"
+                       f"User note: {caption or default_note}")
+
         history = chat_history.setdefault(chat_id, [])
         history.append({"role": "user", "content": content})
         del history[:-MAX_TURNS]
