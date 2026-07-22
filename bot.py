@@ -18,6 +18,7 @@ Optional:
 Run locally:   python bot.py          (then use a tunnel like ngrok for the webhook)
 Run on Render: gunicorn bot:app
 """
+import base64
 import json
 import os
 import re
@@ -96,7 +97,16 @@ RULES:
 - "სახარჯი მასალები" percentage -> consumables_pct.
 - Ask (need_info) only for truly essential missing data: client name, invoice number, or exchange rate when non-manual items exist and no rate was given. Do NOT ask about optional things — default transport_pct/profit_pct/install_price/consumables_pct to 0 if unstated but mention nothing.
 - Quantities and prices must be numbers, never strings.
-- Never invent products, quantities or prices that were not stated."""
+- Never invent products, quantities or prices that were not stated.
+
+SUPPLIER PRICE LISTS (PDF):
+- The user may upload a supplier price list as a PDF (e.g. cable supplier Elvare). Extract only the products the user asks for, or all listed products if they say to include everything, with quantities from the user's message.
+- If supplier prices are in USD, use them as cost_usd (manual=false) with the exchange_rate/transport/profit the user gives.
+- If supplier prices are in GEL and the user gives a markup %, compute the final unit price yourself: price = supplier_price * (1 + markup/100), rounded to 2 decimals, and output the item as manual=true with that price.
+- Per-product markups override the global one ("კაბელებზე 15%, დანარჩენზე 10%").
+- Installation prices come from the user's message, per product or per group.
+- Copy product names from the PDF accurately (keep type/size markings like JE-H(St)H 1x2x0.8).
+- After receiving a PDF, if the user has not yet said quantities, markup or installation prices, reply need_info asking for them in one short Georgian question."""
 
 HELP_TEXT = (
     "გამარჯობა! მე ვარ გერნერის ინვოისების ბოტი. 🧾\n\n"
@@ -112,6 +122,12 @@ HELP_TEXT = (
     "მონტაჟი დეტექტორზე 15 ლარი, დანარჩენზე 20 ლარი.\n"
     "კაბელი JE-H(St)H 1x2x0.8 — 800 მეტრი, 2.5 ლარი მეტრი, მონტაჟი 1.5 ლარი.\n"
     "სახარჯი მასალები 5%.\n\n"
+    "📄 ასევე შეგიძლიათ ატვირთოთ მომწოდებლის პრაისი PDF ფორმატში — "
+    "შემდეგ მომწერეთ რომელი პროდუქტები გჭირდებათ, რაოდენობები, "
+    "მარკაპი (მაგ. 10% ან 15%, ან სხვადასხვა პროდუქტზე სხვადასხვა) "
+    "და მონტაჟის ფასები.\n\n"
+    "ნებისმიერი პროდუქტი, რომელიც სიაში არ არის, უბრალოდ აღწერეთ ტექსტში "
+    "ფასთან ერთად და დაემატება.\n\n"
     "ახალი ინვოისის დასაწყებად სუფთა ფურცლიდან გამოიყენეთ /clear"
 )
 
@@ -131,6 +147,17 @@ def tg_send_document(chat_id, file_obj, filename):
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         timeout=60,
     )
+
+
+def tg_download_file(file_id):
+    """Download a file sent to the bot; returns raw bytes or None."""
+    r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
+    r.raise_for_status()
+    file_path = r.json()["result"]["file_path"]
+    f = requests.get(
+        f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=60)
+    f.raise_for_status()
+    return f.content
 
 
 # ---------------------------------------------------------------- Claude parse
@@ -185,8 +212,41 @@ def webhook():
                      "გადაუგზავნეთ ადმინისტრატორს დასამატებლად.")
         return jsonify(ok=True)
 
+    document = message.get("document")
+    if document:
+        mime = document.get("mime_type", "")
+        size = document.get("file_size", 0)
+        if mime != "application/pdf":
+            tg_send_text(chat_id, "ამ ეტაპზე მხოლოდ PDF ფაილების მიღება შემიძლია.")
+            return jsonify(ok=True)
+        if size > 15 * 1024 * 1024:
+            tg_send_text(chat_id, "ფაილი ძალიან დიდია (მაქს. 15 MB).")
+            return jsonify(ok=True)
+        try:
+            pdf_bytes = tg_download_file(document["file_id"])
+        except Exception:
+            app.logger.exception("File download failed")
+            tg_send_text(chat_id, "ფაილის ჩამოტვირთვა ვერ მოხერხდა, სცადეთ თავიდან.")
+            return jsonify(ok=True)
+
+        caption = (message.get("caption") or "").strip()
+        content = [
+            {"type": "document",
+             "source": {"type": "base64",
+                        "media_type": "application/pdf",
+                        "data": base64.b64encode(pdf_bytes).decode()}},
+            {"type": "text",
+             "text": caption or "მომწოდებლის პრაისი ავტვირთე. (supplier price list uploaded)"},
+        ]
+        history = chat_history.setdefault(chat_id, [])
+        history.append({"role": "user", "content": content})
+        del history[:-MAX_TURNS]
+        tg_send_text(chat_id, "📄 ფაილი მივიღე, ვამუშავებ...")
+        _process_and_reply(chat_id, history)
+        return jsonify(ok=True)
+
     if not text:
-        tg_send_text(chat_id, "გთხოვთ გამომიგზავნოთ ტექსტური შეტყობინება.")
+        tg_send_text(chat_id, "გთხოვთ გამომიგზავნოთ ტექსტური შეტყობინება ან PDF ფაილი.")
         return jsonify(ok=True)
 
     if text.startswith("/start") or text.startswith("/help"):
@@ -201,20 +261,24 @@ def webhook():
     history = chat_history.setdefault(chat_id, [])
     history.append({"role": "user", "content": text})
     del history[:-MAX_TURNS]
+    _process_and_reply(chat_id, history)
+    return jsonify(ok=True)
 
+
+def _process_and_reply(chat_id, history):
     try:
         result = parse_with_claude(history)
     except Exception as e:
         app.logger.exception("Claude parse failed")
         tg_send_text(chat_id, f"ვერ დავამუშავე მოთხოვნა ({type(e).__name__}). "
                               "სცადეთ თავიდან ან /clear.")
-        return jsonify(ok=True)
+        return
 
     if result.get("status") == "need_info":
         question = result.get("message", "დამატებითი ინფორმაცია მჭირდება.")
         history.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
         tg_send_text(chat_id, question)
-        return jsonify(ok=True)
+        return
 
     if result.get("status") == "ok" and result.get("invoice"):
         try:
@@ -222,7 +286,7 @@ def webhook():
         except Exception as e:
             app.logger.exception("Excel generation failed")
             tg_send_text(chat_id, f"Excel-ის გენერაცია ჩაიშალა ({type(e).__name__}).")
-            return jsonify(ok=True)
+            return
 
         inv = result["invoice"]
         summary = (f"✅ ინვოისი {inv.get('invoice_number', '')} — "
@@ -231,10 +295,9 @@ def webhook():
         tg_send_text(chat_id, summary)
         tg_send_document(chat_id, file_obj, filename)
         chat_history.pop(chat_id, None)   # invoice done — fresh start
-        return jsonify(ok=True)
+        return
 
     tg_send_text(chat_id, "გაუგებარი პასუხი მივიღე. სცადეთ თავიდან ან /clear.")
-    return jsonify(ok=True)
 
 
 @app.route("/", methods=["GET"])
