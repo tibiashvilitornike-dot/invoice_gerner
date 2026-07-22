@@ -66,6 +66,7 @@ One of two shapes:
   "invoice": {{
     "client_name": "<string>",
     "invoice_number": "<string>",
+    "project_title": "<string, default 'სახანძრო სიგნალიზაციის მიწოდება და მონტაჟი'>",
     "consumables_pct": <number, default 0>,
     "items": [
       {{
@@ -90,13 +91,18 @@ One of two shapes:
 
 RULES:
 - Match products to the library by meaning, not exact wording ("კვამლის დეტექტორი", "smoke detector", "დეტექტორი" -> smoke_det, etc.). If matched, set product_id and omit name.
-- "manual": false items are calculated from USD cost x exchange rate x transport x profit. Use this whenever a USD cost is known (from the library or from the message).
+- "manual": false items are calculated from cost x coefficient x transport x profit. The coefficient is just a multiplier the user gives (e.g. 2.75) — it converts cost to GEL. NEVER ask what currency the cost is in or what the coefficient represents. Just multiply.
 - "manual": true items have a fixed final GEL price given directly (typical for cable per meter, pipe, custom services). Then set "price" and omit cost_usd/exchange_rate/transport_pct/profit_pct.
 - If the user gives one exchange rate / transport % / profit % (a global markup), apply it to every non-manual item.
 - If the user says a markup like "მოგება 25%" or "25% margin", that is profit_pct. "ტრანსპორტი" is transport_pct. "კურსი" is exchange_rate.
 - Installation prices: "მონტაჟი X ლარი" per item, or a global installation price if stated for all. Cable installation price goes to install_price of the cable line with manual pricing for the material if a GEL price is given.
 - "სახარჯი მასალები" percentage -> consumables_pct.
-- Ask (need_info) only for truly essential missing data: client name, invoice number, or exchange rate when non-manual items exist and no rate was given. Do NOT ask about optional things — default transport_pct/profit_pct/install_price/consumables_pct to 0 if unstated but mention nothing.
+- Ask (need_info) only for truly essential missing data: client name and invoice number. Do NOT ask about optional things — default transport_pct/profit_pct/install_price/consumables_pct/exchange_rate to 0 if unstated.
+- NEVER ask about currency (USD, EUR, etc.) or what the coefficient means. The user gives a number — use it as exchange_rate directly.
+- If the user provides a project title or description (e.g. "სათაური: ...", "პროექტი: ..."), put it in project_title. Otherwise use the default.
+- CRITICAL: when asking need_info, list ALL missing items in ONE single message. Never ask questions one at a time across multiple turns.
+- CRITICAL: before asking anything, re-read the ENTIRE conversation. Never ask for information the user has already provided in any earlier message or file caption. If the user already answered, use their answer.
+- If after one need_info round something minor is still unclear, make a reasonable assumption and proceed rather than asking again.
 - Quantities and prices must be numbers, never strings.
 - Never invent products, quantities or prices that were not stated.
 
@@ -178,6 +184,85 @@ def excel_to_text(file_bytes):
 
 # ---------------------------------------------------------------- Claude parse
 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def extract_pdf_text_local(pdf_bytes):
+    """FREE: pull the text layer out of a digital PDF. Returns '' for scanned PDFs."""
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages[:40]:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts).strip()[:60000]
+
+
+def extract_pricelist_gemini(pdf_bytes):
+    """FREE tier: Gemini reads scanned/complex PDFs at no cost."""
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{
+                "parts": [
+                    {"inline_data": {
+                        "mime_type": "application/pdf",
+                        "data": base64.b64encode(pdf_bytes).decode()}},
+                    {"text": "This is a supplier price list. Extract EVERY product as a "
+                             "tab-separated table: name<TAB>unit<TAB>price<TAB>currency. "
+                             "Copy names exactly, including type/size markings. "
+                             "Output ONLY the table, no commentary."},
+                ],
+            }],
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return "".join(
+        p.get("text", "")
+        for p in data["candidates"][0]["content"]["parts"]
+    ).strip()
+
+
+def extract_pricelist_from_pdf(pdf_bytes):
+    """One-time extraction: PDF -> compact text table. Keeps follow-up turns fast."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": CLAUDE_MODEL,
+            "max_tokens": 8000,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document",
+                     "source": {"type": "base64",
+                                "media_type": "application/pdf",
+                                "data": base64.b64encode(pdf_bytes).decode()}},
+                    {"type": "text",
+                     "text": "This is a supplier price list. Extract EVERY product as a "
+                             "tab-separated table: name<TAB>unit<TAB>price<TAB>currency. "
+                             "Copy names exactly, including type/size markings. "
+                             "Output ONLY the table, no commentary."},
+                ],
+            }],
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    return "".join(
+        b.get("text", "") for b in resp.json().get("content", [])
+        if b.get("type") == "text"
+    ).strip()
+
+
 def parse_with_claude(messages):
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -189,7 +274,8 @@ def parse_with_claude(messages):
         json={
             "model": CLAUDE_MODEL,
             "max_tokens": 4000,
-            "system": SYSTEM_PROMPT,
+            "system": [{"type": "text", "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
         },
         timeout=120,
@@ -261,13 +347,32 @@ def webhook():
         default_note = "მომწოდებლის პრაისი ავტვირთე. (supplier price list uploaded)"
 
         if is_pdf:
-            content = [
-                {"type": "document",
-                 "source": {"type": "base64",
-                            "media_type": "application/pdf",
-                            "data": base64.b64encode(file_bytes).decode()}},
-                {"type": "text", "text": caption or default_note},
-            ]
+            tg_send_text(chat_id, "📄 ფაილი მივიღე, ვკითხულობ პრაისს...")
+            sheet_text = ""
+            # 1) FREE: local text layer (works for most digital price lists)
+            try:
+                sheet_text = extract_pdf_text_local(file_bytes)
+            except Exception:
+                app.logger.exception("Local PDF extraction failed")
+            # 2) FREE: Gemini for scanned / image-only PDFs
+            if len(sheet_text) < 200 and GEMINI_API_KEY:
+                try:
+                    sheet_text = extract_pricelist_gemini(file_bytes)
+                except Exception:
+                    app.logger.exception("Gemini extraction failed")
+            # 3) PAID fallback: Claude reads the PDF
+            if len(sheet_text) < 200:
+                try:
+                    sheet_text = extract_pricelist_from_pdf(file_bytes)
+                except Exception:
+                    app.logger.exception("Claude PDF extraction failed")
+            if len(sheet_text) < 20:
+                tg_send_text(chat_id, "PDF-ის წაკითხვა ვერ მოხერხდა, სცადეთ თავიდან "
+                                      "ან ატვირთეთ Excel ვერსია.")
+                return jsonify(ok=True)
+            content = (f"Supplier price list ({fname}), extracted contents:\n"
+                       f"{sheet_text}\n\n"
+                       f"User note: {caption or default_note}")
         else:
             try:
                 if is_xlsx:
@@ -286,7 +391,8 @@ def webhook():
         history = chat_history.setdefault(chat_id, [])
         history.append({"role": "user", "content": content})
         del history[:-MAX_TURNS]
-        tg_send_text(chat_id, "📄 ფაილი მივიღე, ვამუშავებ...")
+        if not is_pdf:
+            tg_send_text(chat_id, "📄 ფაილი მივიღე, ვამუშავებ...")
         _process_and_reply(chat_id, history)
         return jsonify(ok=True)
 

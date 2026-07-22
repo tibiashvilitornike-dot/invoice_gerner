@@ -100,9 +100,10 @@ def build_invoice_xlsx(data):
     ws["A9"].font = font_client_title
 
     # 3. პროექტის დასახელება
+    project_title = data.get('project_title', 'სახანძრო სიგნალიზაციის მიწოდება და მონტაჟი')
     ws["A13"] = "მომსახურების დასახელება:"
     ws["A13"].font = Font(name=font_main, size=10, bold=True, color="64748B")
-    ws["A14"] = "სახანძრო სიგნალიზაციის მიწოდება და მონტაჟი"
+    ws["A14"] = project_title
     ws["A14"].font = Font(name=font_main, size=13, bold=True, color="1E293B")
     ws.row_dimensions[14].height = 22
 
