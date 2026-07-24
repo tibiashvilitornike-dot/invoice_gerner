@@ -43,6 +43,10 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 
 app = Flask(__name__)
 
+
+class TruncatedResponse(Exception):
+    pass
+
 # In-memory conversation buffer per chat (survives until restart; enough for
 # "the bot asked me a follow-up question" flows).
 chat_history = {}   # chat_id -> [{"role": "...", "content": "..."}]
@@ -117,6 +121,7 @@ VAT ON SUPPLIER PRICES:
 
 NBG EXCHANGE RATE:
 - A line "TODAY_NBG_USD_RATE: <number>" may follow this prompt. Use it as exchange_rate ONLY when the user explicitly asks for the official/today's/NBG rate ("ენბ-ის კურსით", "დღევანდელი კურსით", "ოფიციალური კურსით"). NEVER replace a coefficient the user states themselves — fire alarm products especially are always quoted with the user's own fixed coefficient.
+- COMPACTNESS: omit any field that would be 0, empty or default (transport_pct, profit_pct, install_price, consumables_pct, unit when it is "ცალი"). Output no whitespace-heavy formatting. This keeps long invoices within the response limit.
 - Quantities and prices must be numbers, never strings.
 - Never invent products, quantities or prices that were not stated.
 
@@ -207,8 +212,6 @@ def excel_to_text(file_bytes):
 
 # ---------------------------------------------------------------- Claude parse
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.5-flash"
 
 _nbg_cache = {}
 
@@ -242,35 +245,6 @@ def extract_pdf_text_local(pdf_bytes):
     return "\n".join(parts).strip()[:60000]
 
 
-def extract_pricelist_gemini(pdf_bytes):
-    """FREE tier: Gemini reads scanned/complex PDFs at no cost."""
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent",
-        params={"key": GEMINI_API_KEY},
-        json={
-            "contents": [{
-                "parts": [
-                    {"inline_data": {
-                        "mime_type": "application/pdf",
-                        "data": base64.b64encode(pdf_bytes).decode()}},
-                    {"text": "This is a supplier price list. Extract EVERY product as a "
-                             "tab-separated table: name<TAB>unit<TAB>price<TAB>currency. "
-                             "Copy names exactly, including type/size markings. "
-                             "Output ONLY the table, no commentary."},
-                ],
-            }],
-        },
-        timeout=180,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return "".join(
-        p.get("text", "")
-        for p in data["candidates"][0]["content"]["parts"]
-    ).strip()
-
-
 def extract_pricelist_from_pdf(pdf_bytes):
     """One-time extraction: PDF -> compact text table. Keeps follow-up turns fast."""
     resp = requests.post(
@@ -291,10 +265,14 @@ def extract_pricelist_from_pdf(pdf_bytes):
                                 "media_type": "application/pdf",
                                 "data": base64.b64encode(pdf_bytes).decode()}},
                     {"type": "text",
-                     "text": "This is a supplier price list. Extract EVERY product as a "
-                             "tab-separated table: name<TAB>unit<TAB>price<TAB>currency. "
-                             "Copy names exactly, including type/size markings. "
-                             "Output ONLY the table, no commentary."},
+                     "text": "This is a supplier price list, quotation or invoice. Extract EVERY "
+                             "product row as a tab-separated table with these columns:\n"
+                             "name<TAB>unit<TAB>quantity<TAB>unit_price<TAB>currency<TAB>discount_pct\n"
+                             "Keep each product on ONE line even if its description wraps "
+                             "across several lines in the document. Copy names exactly, "
+                             "including codes and type/size markings (e.g. BSR-6155/C, "
+                             "N2XH 3x2.5). Leave a cell empty if the document has no such "
+                             "value. Output ONLY the table, no commentary."},
                 ],
             }],
         },
@@ -317,7 +295,7 @@ def parse_with_claude(messages):
         },
         json={
             "model": CLAUDE_MODEL,
-            "max_tokens": 4000,
+            "max_tokens": 16000,
             "system": ([{"type": "text", "text": SYSTEM_PROMPT,
                          "cache_control": {"type": "ephemeral"}}]
                        + ([{"type": "text",
@@ -328,14 +306,26 @@ def parse_with_claude(messages):
         timeout=120,
     )
     resp.raise_for_status()
+    payload = resp.json()
     text = "".join(
-        block.get("text", "") for block in resp.json().get("content", [])
+        block.get("text", "") for block in payload.get("content", [])
         if block.get("type") == "text"
     )
+    if payload.get("stop_reason") == "max_tokens":
+        raise TruncatedResponse(
+            "პასუხი ძალიან გრძელია — სცადეთ ფაილის ნაწილებად დამუშავება "
+            "(მაგ. ჯერ კაბელები, მერე ავტომატები).")
     # strip accidental code fences and grab the JSON object
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+    if start == -1 or end == -1:
+        app.logger.error("No JSON in model reply: %s", text[:500])
+        raise ValueError("model did not return JSON")
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        app.logger.error("Bad JSON (%d chars): %s", len(text), text[-500:])
+        raise
 
 
 # ---------------------------------------------------------------- Webhook
@@ -467,23 +457,17 @@ def handle_message(message):
         if is_pdf:
             tg_send_text(chat_id, "📄 ფაილი მივიღე, ვკითხულობ პრაისს...")
             sheet_text = ""
-            # 1) FREE: local text layer (works for most digital price lists)
+            # 1) Claude reads the PDF natively — understands real table layout
             try:
-                sheet_text = extract_pdf_text_local(file_bytes)
+                sheet_text = extract_pricelist_from_pdf(file_bytes)
             except Exception:
-                app.logger.exception("Local PDF extraction failed")
-            # 2) FREE: Gemini for scanned / image-only PDFs
-            if len(sheet_text) < 200 and GEMINI_API_KEY:
+                app.logger.exception("Claude PDF extraction failed")
+            # 2) Fallback: raw local text layer (free, but layout can be mangled)
+            if len(sheet_text) < 40:
                 try:
-                    sheet_text = extract_pricelist_gemini(file_bytes)
+                    sheet_text = extract_pdf_text_local(file_bytes)
                 except Exception:
-                    app.logger.exception("Gemini extraction failed")
-            # 3) PAID fallback: Claude reads the PDF
-            if len(sheet_text) < 200:
-                try:
-                    sheet_text = extract_pricelist_from_pdf(file_bytes)
-                except Exception:
-                    app.logger.exception("Claude PDF extraction failed")
+                    app.logger.exception("Local PDF extraction failed")
             if len(sheet_text) < 20:
                 tg_send_text(chat_id, "PDF-ის წაკითხვა ვერ მოხერხდა, სცადეთ თავიდან "
                                       "ან ატვირთეთ Excel ვერსია.")
@@ -587,6 +571,9 @@ def _generate_and_send(chat_id, inv):
 def _process_and_reply(chat_id, history):
     try:
         result = parse_with_claude(history)
+    except TruncatedResponse as e:
+        tg_send_text(chat_id, str(e))
+        return
     except Exception as e:
         app.logger.exception("Claude parse failed")
         tg_send_text(chat_id, f"ვერ დავამუშავე მოთხოვნა ({type(e).__name__}). "
