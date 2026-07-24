@@ -86,7 +86,11 @@ One of two shapes:
         "exchange_rate": <number, USD->GEL>,
         "transport_pct": <number>,
         "profit_pct": <number>,
-        "price": <number; final unit price in GEL, only when manual=true>,
+        "supplier_price": <number; price exactly as printed in the supplier document>,
+        "markup_pct": <number; markup to add, e.g. 15>,
+        "strip_vat": <true when supplier prices include VAT and must be reduced>,
+        "discount_pct": <number; discount printed in the document, if any>,
+        "price": <number; ONLY when the user states a final GEL price directly>,
         "install_price": <number; installation price per unit in GEL, default 0>
       }}
     ]
@@ -116,8 +120,15 @@ INSTALLATION PRICES BY CATEGORY:
 - Cables: total cross-section (mm2) = cores x core size. Examples: N2XH 3x2.5 -> 7.5; N2XH 5x10 -> 50; N2XH 2X10+1X6 -> 26; NA2XY 5x95 -> 475. When the user gives tiered installation prices by cross-section (e.g. "60მმ-მდე 1 ლარი, 120მმ-დან 2 ლარი"), compute each cable's total cross-section and set install_price from the matching tier. If a cable falls between stated tiers, use the lower tier's price unless told otherwise.
 - Circuit breakers: MCB = miniature breaker (e.g. Tengen TGB1N-63, 6kA series); MCCB = molded-case breaker with adjustable release (e.g. Tengen TGM1NE, 50kA). When the user gives per-category prices ("MCB-ზე 15 ლარი, MCCB-ზე 50 ლარი"), classify each breaker and apply the matching install_price.
 
-VAT ON SUPPLIER PRICES:
-- If the user says supplier prices include VAT ("დღგ-ით არის", "დღგ ამოაკლე", "prices include VAT"), first strip it: base = price / 1.18, THEN apply the markup, rounded to 2 decimals. The invoice adds 18% VAT at the end, so this prevents double VAT.
+VAT AND MARKUP ON SUPPLIER PRICES — DO NOT DO THIS ARITHMETIC YOURSELF:
+- For any item priced in GEL from a supplier document, output these fields INSTEAD of "price":
+    "supplier_price": <the exact price printed in the document, unchanged>
+    "markup_pct": <markup the user asked for, e.g. 15>
+    "strip_vat": true|false
+  and set "manual": true. The server computes the final price.
+- Set "strip_vat": true whenever the user indicates supplier prices contain VAT and should be reduced. Recognise ANY phrasing, including: "დღგ გამოაკელი", "გამოაკელი დღგ 18%", "დღგ ამოაკლე", "დღგ-ს გარეშე", "დღგ-ით არის", "მინუს დღგ", "remove VAT", "prices include VAT", "net of VAT".
+- Georgian supplier invoices (Elvare and similar) normally print prices WITH VAT, so if the user asks to remove VAT, strip_vat is true for every item from that document.
+- NEVER pre-calculate the discounted or marked-up number yourself. Copy the printed price verbatim into supplier_price.
 
 NBG EXCHANGE RATE:
 - A line "TODAY_NBG_USD_RATE: <number>" may follow this prompt. Use it as exchange_rate ONLY when the user explicitly asks for the official/today's/NBG rate ("ენბ-ის კურსით", "დღევანდელი კურსით", "ოფიციალური კურსით"). NEVER replace a coefficient the user states themselves — fire alarm products especially are always quoted with the user's own fixed coefficient.
@@ -130,7 +141,7 @@ SUPPLIER PRICE LISTS (PDF, Excel or CSV):
 - QUANTITIES: if the file already contains a quantity column (quotations, proformas and supplier invoices almost always do), USE THOSE QUANTITIES. Never ask the user for quantities that are already in the file. Ask only for products where the file genuinely has no quantity (pure price lists) and the user has not stated one.
 - SCOPE: include every product in the file unless the user names a subset.
 - FOREIGN CURRENCY (USD, EUR, or any other): put the supplier price in cost_usd (the column is just "cost") and set manual=false, using the coefficient/transport/profit the user gives. The coefficient is a plain multiplier — never ask which currency it is for.
-- GEL prices with a markup %: compute the final unit price yourself: price = supplier_price * (1 + markup/100), rounded to 2 decimals, output as manual=true.
+- GEL prices with a markup %: output supplier_price + markup_pct + strip_vat (see VAT section) with manual=true. Do not compute the price.
 - If the file shows a discount column, apply the discount before markup.
 - Per-product markups override the global one ("კაბელებზე 15%, დანარჩენზე 10%").
 - Installation prices come from the user's message, per product or per group.
@@ -519,6 +530,28 @@ def handle_message(message):
     return
 
 
+VAT_RATE = 0.18
+
+
+def apply_pricing(inv):
+    """Compute final GEL unit prices in code, not in the model."""
+    for it in inv.get("items", []):
+        sp = it.pop("supplier_price", None)
+        markup = float(it.pop("markup_pct", 0) or 0)
+        strip = bool(it.pop("strip_vat", False))
+        discount = float(it.pop("discount_pct", 0) or 0)
+        if sp is None:
+            continue
+        base = float(sp)
+        if discount:
+            base *= (1 - discount / 100)
+        if strip:
+            base /= (1 + VAT_RATE)
+        it["price"] = round(base * (1 + markup / 100), 2)
+        it["manual"] = True
+    return inv
+
+
 def _estimate_totals(inv):
     material = install = 0.0
     for it in inv.get("items", []):
@@ -587,7 +620,7 @@ def _process_and_reply(chat_id, history):
         return
 
     if result.get("status") == "ok" and result.get("invoice"):
-        inv = result["invoice"]
+        inv = apply_pricing(result["invoice"])
         pending_invoices[chat_id] = inv
         history.append({"role": "assistant",
                         "content": json.dumps(result, ensure_ascii=False)})
